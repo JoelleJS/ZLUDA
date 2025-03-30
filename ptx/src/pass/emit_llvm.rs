@@ -38,6 +38,7 @@ use llvm_zluda::bit_writer::LLVMWriteBitcodeToMemoryBuffer;
 use llvm_zluda::{core::*, *};
 use llvm_zluda::{prelude::*, LLVMZludaBuildAtomicRMW};
 use llvm_zluda::{LLVMCallConv, LLVMZludaBuildAlloca};
+use ptx_parser::Mul24Control;
 
 const LLVM_UNNAMED: &CStr = c"";
 // https://llvm.org/docs/AMDGPUUsage.html#address-spaces
@@ -217,11 +218,7 @@ impl Deref for MemoryBuffer {
 impl From<Vec<i8>> for MemoryBuffer {
     fn from(value: Vec<i8>) -> Self {
         let memory_buffer: LLVMMemoryBufferRef = unsafe {
-            LLVMCreateMemoryBufferWithMemoryRangeCopy(
-                value.as_ptr(),
-                value.len(),
-                ptr::null()
-            )
+            LLVMCreateMemoryBufferWithMemoryRangeCopy(value.as_ptr(), value.len(), ptr::null())
         };
         Self(memory_buffer)
     }
@@ -2331,8 +2328,13 @@ impl<'a> MethodEmitContext<'a> {
     ) -> Result<(), TranslateError> {
         let src1 = self.resolver.value(arguments.src1)?;
         let src2 = self.resolver.value(arguments.src2)?;
-        self.emit_intrinsic(
-            c"llvm.amdgcn.mul.u24",
+        let name_lo = match data.type_ {
+            ast::ScalarType::U32 => c"llvm.amdgcn.mul.u24",
+            ast::ScalarType::S32 => c"llvm.amdgcn.mul.i24",
+            _ => return Err(error_unreachable()),
+        };
+        let res_lo = self.emit_intrinsic(
+            name_lo,
             Some(arguments.dst),
             Some(&ast::Type::Scalar(data.type_)),
             vec![
@@ -2340,6 +2342,37 @@ impl<'a> MethodEmitContext<'a> {
                 (src2, get_scalar_type(self.context, data.type_)),
             ],
         )?;
+        if data.control == Mul24Control::Hi {
+            // There is an important difference between NVIDIA's mul24 and AMD's mulhi.[ui]24.
+            // NVIDIA: Returns bits 47..16 of the 64-bit result
+            // AMD: Returns bits 63..32 of the 64-bit result
+            // Hence we need to compute both hi and lo, shift the results and add them together to replicate NVIDIA's mul24
+            let name_hi = match data.type_ {
+                ast::ScalarType::U32 => c"llvm.amdgcn.mulhi.u24",
+                ast::ScalarType::S32 => c"llvm.amdgcn.mulhi.i24",
+                _ => return Err(error_unreachable()),
+            };
+            let res_hi = self.emit_intrinsic(
+                name_hi,
+                None,
+                Some(&ast::Type::Scalar(data.type_)),
+                vec![
+                    (src1, get_scalar_type(self.context, data.type_)),
+                    (src2, get_scalar_type(self.context, data.type_)),
+                ],
+            )?;
+            let shift_number = unsafe { LLVMConstInt(LLVMInt32TypeInContext(self.context), 16, 0) };
+            let res_lo_shr = unsafe {
+                LLVMBuildLShr(self.builder, res_lo, shift_number, c"res_lo_shr".as_ptr())
+            };
+            let res_hi_shl =
+                unsafe { LLVMBuildShl(self.builder, res_hi, shift_number, c"res_hi_shl".as_ptr()) };
+
+            self.resolver
+                .with_result(arguments.dst, |dst: *const i8| unsafe {
+                    LLVMBuildAdd(self.builder, res_lo_shr, res_hi_shl, dst)
+                });
+        }
         Ok(())
     }
 
